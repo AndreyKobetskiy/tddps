@@ -7,13 +7,13 @@ from math import hypot, sqrt
 from pathlib import Path
 from statistics import median
 
-from generate import FIELDS, NOISE
+from equipment import EQUIPMENT, lathe_current
 
-COMMON = FIELDS[:3]
+LATHE = EQUIPMENT[0]
+COMMON = LATHE.fields[:3]
 SUPPORTED = (*COMMON, "current_a")
-SIGMA = dict(zip(FIELDS, NOISE))
+SIGMA = dict(zip(LATHE.fields, LATHE.noise))
 CURRENT_SIGMA = hypot(SIGMA["current_a"], 0.12 * SIGMA["load_pct"])
-PEER_SCALES = {field: sqrt(2) * SIGMA[field] for field in COMMON}
 THRESHOLD = 5
 
 
@@ -47,7 +47,10 @@ def read_rows(path):
         yield from csv.DictReader(file)
 
 
-def detect_partition(path, machines, histories):
+def detect_partition(path, machines, histories, spec):
+    common = spec.fields[:3]
+    scales = {field: sqrt(2) * noise for field, noise in zip(common, spec.noise)}
+    expected_observers = spec.observers
     for timestamp_text, rows in groupby(read_rows(path), key=lambda row: row["timestamp_ms"]):
         timestamp = int(timestamp_text)
         groups = defaultdict(list)
@@ -55,19 +58,22 @@ def detect_partition(path, machines, histories):
             observer = int(row["observer_id"])
             groups[machines[observer]].append((observer, row))
         for readings in groups.values():
-            if len({observer for observer, _ in readings}) != 3 or len(readings) != 3:
-                raise ValueError(f"Expected three distinct observers at {timestamp}")
+            if (len({observer for observer, _ in readings}) != expected_observers
+                    or len(readings) != expected_observers):
+                raise ValueError(f"Expected {expected_observers} distinct observers at {timestamp}")
             centers = {
                 field: median(float(row[field]) for _, row in readings)
-                for field in COMMON
+                for field in common
             }
-            expected_current = 2.5 + 0.12 * centers["load_pct"]
+            expected_current = None
+            if spec.kind == "lathe":
+                expected_current = lathe_current(centers["load_pct"])
             for observer, row in readings:
-                for field in COMMON:
-                    score = abs(float(row[field]) - centers[field]) / PEER_SCALES[field]
+                for field in common:
+                    score = abs(float(row[field]) - centers[field]) / scales[field]
                     if score > THRESHOLD:
                         yield (observer, timestamp, field), score, "peer_median"
-                if row["current_a"]:
+                if expected_current is not None and row["current_a"]:
                     residual = float(row["current_a"]) - expected_current
                     score = histories[observer].score(timestamp, residual)
                     if score > THRESHOLD:
@@ -81,12 +87,21 @@ def main():
     parser.add_argument("--evaluate", action="store_true")
     args = parser.parse_args()
 
-    parts = sorted((args.dataset / "observations").glob("part-*.csv"),
-                   key=lambda path: int(path.stem.split("-")[1]))
+    observations = args.dataset / "observations"
+    parts = []
+    for spec in EQUIPMENT:
+        folder = observations / spec.kind
+        if folder.is_dir():
+            parts.extend((part, spec) for part in folder.glob("part-*.csv"))
+    if not parts:
+        parts = [(part, LATHE) for part in observations.glob("part-*.csv")]
+    parts.sort(key=lambda entry: (int(entry[0].stem.split("-")[1]), entry[1].kind))
     if not parts:
         parser.error("no observation partitions found")
     label_dir = args.dataset / "anomaly_labels"
-    if args.evaluate and any(not (label_dir / part.name).is_file() for part in parts):
+    if args.evaluate and any(
+        not (label_dir / part.relative_to(observations)).is_file() for part, _ in parts
+    ):
         parser.error("evaluation requires matching label partitions")
     machines = {
         int(row["observer_id"]): int(row["machine_id"])
@@ -98,16 +113,17 @@ def main():
     with args.output.open("x", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
         writer.writerow(("observer_id", "timestamp_ms", "field", "score", "method"))
-        for part in parts:
+        for part, spec in parts:
             labels = set()
             if args.evaluate:
                 labels = {
                     (int(row["observer_id"]), int(row["timestamp_ms"]), row["field"])
-                    for row in read_rows(label_dir / part.name)
+                    for row in read_rows(label_dir / part.relative_to(observations))
                 }
                 all_labels += len(labels)
-                supported_labels += sum(field in SUPPORTED for _, _, field in labels)
-            for key, score, method in detect_partition(part, machines, histories):
+                fields = SUPPORTED if spec.kind == "lathe" else spec.fields[:3]
+                supported_labels += sum(field in fields for _, _, field in labels)
+            for key, score, method in detect_partition(part, machines, histories, spec):
                 writer.writerow((*key, f"{score:.4f}", method))
                 predicted += 1
                 true_positive += key in labels

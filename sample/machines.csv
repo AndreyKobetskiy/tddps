@@ -1,7 +1,7 @@
-machine_id,name
-1,machine-01
-2,machine-02
-3,machine-03
-4,machine-04
-5,machine-05
-6,machine-06
+machine_id,kind
+1,lathe
+2,pump
+3,compressor
+4,furnace
+5,conveyor
+6,chiller
